@@ -249,7 +249,6 @@ def parse_etsy_search_html(html, limit=20):
 
 # --- PLATFORM SEARCH ROUTER ---
 def scrape_structured(keyword, platform, api_key, limit=20, provider="ScraperAPI"):
-    # If using ScraperAPI, use their structured JSON search endpoints for high efficiency
     if provider == "ScraperAPI":
         if platform == "Amazon":
             endpoints = ["https://api.scraperapi.com/structured/amazon/search"]
@@ -332,7 +331,6 @@ def scrape_structured(keyword, platform, api_key, limit=20, provider="ScraperAPI
                 print(f"Error scraping structured {platform} via ScraperAPI: {e}")
                 continue
 
-    # If using Scrape.do or ScrapingBee, fetch raw search HTML and parse on the fly
     else:
         if platform == "Amazon":
             target_url = f"https://www.amazon.com/s?k={keyword.replace(' ', '+')}"
@@ -355,9 +353,7 @@ def scrape_structured(keyword, platform, api_key, limit=20, provider="ScraperAPI
 
 # --- ETSY DIRECT SEARCH OR SCAPERAPI DISCOVERY ---
 def scrape_etsy(keyword, api_key, limit=20, provider="ScraperAPI"):
-    # ScraperAPI uses its optimized two-stage detail logic
     if provider == "ScraperAPI":
-        # Discover listing links via google search endpoint
         payload = {
             'api_key': api_key,
             'query': f'site:etsy.com/listing {keyword}',
@@ -379,7 +375,6 @@ def scrape_etsy(keyword, api_key, limit=20, provider="ScraperAPI"):
         except Exception as e:
             print(f"Etsy discovery failed: {e}")
 
-        # Fallback to direct search if google discovery fails
         if not listing_urls:
             search_url = f'https://www.etsy.com/search?q={keyword.replace(" ", "+")}'
             html = fetch_page_html(search_url, provider, api_key)
@@ -449,7 +444,6 @@ def scrape_etsy(keyword, api_key, limit=20, provider="ScraperAPI"):
                 continue
         return all_items
 
-    # If using Scrape.do or ScrapingBee, directly parse Etsy search HTML on the fly
     else:
         target_url = f"https://www.etsy.com/search?q={keyword.replace(' ', '+')}"
         html = fetch_page_html(target_url, provider, api_key)
@@ -506,20 +500,32 @@ st.sidebar.write("---")
 
 st.sidebar.subheader("🛒 Store Selection")
 
-# Initialize and persist widget states safely using Streamlit's built-in key bindings
-platform_amazon = st.sidebar.checkbox("Amazon Marketplace", value=True, key="platform_amazon")
-platform_ebay = st.sidebar.checkbox("eBay Auctions", value=True, key="platform_ebay")
-platform_walmart = st.sidebar.checkbox("Walmart E-Commerce", value=True, key="platform_walmart")
-platform_etsy = st.sidebar.checkbox("Etsy Handmade & Vintage", value=True, key="platform_etsy")
+# Step 1: Initialize states in st.session_state on the very first run to manage values reliably
+if "platform_amazon" not in st.session_state:
+    st.session_state.platform_amazon = True
+if "platform_ebay" not in st.session_state:
+    st.session_state.platform_ebay = True
+if "platform_walmart" not in st.session_state:
+    st.session_state.platform_walmart = True
+if "platform_etsy" not in st.session_state:
+    st.session_state.platform_etsy = True
 
+# Step 2: Render checkboxes using ONLY the key attribute.
+# Crucially, omitting 'value=True' here prevents Streamlit from resetting the state back to True on reruns.
+st.sidebar.checkbox("Amazon Marketplace", key="platform_amazon")
+st.sidebar.checkbox("eBay Auctions", key="platform_ebay")
+st.sidebar.checkbox("Walmart E-Commerce", key="platform_walmart")
+st.sidebar.checkbox("Etsy Handmade & Vintage", key="platform_etsy")
+
+# Step 3: Access states directly from session_state keys
 target_platforms = []
-if platform_amazon:
+if st.session_state.platform_amazon:
     target_platforms.append("Amazon")
-if platform_ebay:
+if st.session_state.platform_ebay:
     target_platforms.append("eBay")
-if platform_walmart:
+if st.session_state.platform_walmart:
     target_platforms.append("Walmart")
-if platform_etsy:
+if st.session_state.platform_etsy:
     target_platforms.append("Etsy")
 
 results_per_platform = st.sidebar.slider("Target Results Per Platform:", min_value=5, max_value=50, value=15, step=5)
