@@ -208,18 +208,18 @@ def parse_walmart_search_html(html, limit=20):
 def parse_etsy_search_html(html, limit=20):
     soup = BeautifulSoup(html, 'html.parser')
     items = []
-    containers = soup.select('.search-listings-group-col .wt-list-unstyled li') or soup.select('.wt-grid .wt-list-unstyled li')
+    containers = soup.select('.search-listings-group-col .wt-list-unstyled li') or soup.select('.wt-grid .wt-list-unstyled li') or soup.select('.search-listings-group li')
     if not containers:
-        containers = soup.select('li.wt-list-unstyled')
+        containers = soup.select('li.wt-list-unstyled') or soup.select('li[data-search-results-listing-card]') or soup.select('.v2-listing-card')
 
     rank = 1
     for container in containers:
-        title_el = container.select_one('h3.wt-text-caption') or container.select_one('.v2-listing-card__title')
+        title_el = container.select_one('h3.wt-text-caption') or container.select_one('.v2-listing-card__title') or container.select_one('h3')
         if not title_el:
             continue
         title = title_el.text.strip()
 
-        price_el = container.select_one('.lc-price') or container.select_one('.currency-value') or container.select_one('.n-listing-card__price')
+        price_el = container.select_one('.lc-price') or container.select_one('.currency-value') or container.select_one('.n-listing-card__price') or container.select_one('.wt-text-title-01')
         price = price_el.text.strip() if price_el else "Check Site"
 
         img_el = container.select_one('img')
@@ -331,6 +331,25 @@ def scrape_structured(keyword, platform, api_key, limit=20, provider="ScraperAPI
                 print(f"Error scraping structured {platform} via ScraperAPI: {e}")
                 continue
 
+        # --- AUTO-FALLBACK TO DIRECT CRAWLING FOR SCRAPERAPI ---
+        # If your plan does not support structured searches, the app pulls the raw HTML 
+        # using generic proxy queries and extracts the lists locally.
+        if platform == "Amazon":
+            target_url = f"https://www.amazon.com/s?k={keyword.replace(' ', '+')}"
+            html = fetch_page_html(target_url, "ScraperAPI", api_key)
+            if html:
+                return parse_amazon_search_html(html, limit)
+        elif platform == "eBay":
+            target_url = f"https://www.ebay.com/sch/i.html?_nkw={keyword.replace(' ', '+')}"
+            html = fetch_page_html(target_url, "ScraperAPI", api_key)
+            if html:
+                return parse_ebay_search_html(html, limit)
+        elif platform == "Walmart":
+            target_url = f"https://www.walmart.com/search?q={keyword.replace(' ', '+')}"
+            html = fetch_page_html(target_url, "ScraperAPI", api_key)
+            if html:
+                return parse_walmart_search_html(html, limit)
+
     else:
         if platform == "Amazon":
             target_url = f"https://www.amazon.com/s?k={keyword.replace(' ', '+')}"
@@ -379,7 +398,7 @@ def scrape_etsy(keyword, api_key, limit=20, provider="ScraperAPI"):
             search_url = f'https://www.etsy.com/search?q={keyword.replace(" ", "+")}'
             html = fetch_page_html(search_url, provider, api_key)
             if html:
-                found = re.findall(r'https://www\.etsy\.com/listing/\d+(?:/[^"\'\s\\%]+)?', html)
+                found = re.findall(r'https://www\.etsy\.com/listing/\d+(?:/[^"\'s\\%]+)?', html)
                 seen = set()
                 for url in found:
                     clean_url = url.split('?')[0]
@@ -392,57 +411,64 @@ def scrape_etsy(keyword, api_key, limit=20, provider="ScraperAPI"):
             detail_payload = {'api_key': api_key, 'url': listing_url, 'country_code': 'us', 'premium': 'true'}
             try:
                 resp = requests.get(SCRAPERAPI_ENDPOINT, params=detail_payload, timeout=70)
-                if resp.status_code != 200:
-                    continue
+                if resp.status_code == 200:
+                    soup = BeautifulSoup(resp.text, 'html.parser')
+                    ld_data = None
+                    for script in soup.find_all('script', attrs={'type': 'application/ld+json'}):
+                        if not script.string:
+                            continue
+                        try:
+                            parsed = json.loads(script.string)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
 
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                ld_data = None
-                for script in soup.find_all('script', attrs={'type': 'application/ld+json'}):
-                    if not script.string:
-                        continue
-                    try:
-                        parsed = json.loads(script.string)
-                    except (json.JSONDecodeError, TypeError):
-                        continue
+                        ld_data = find_product_node(parsed)
+                        if ld_data:
+                            break
 
-                    ld_data = find_product_node(parsed)
+                    title = None
                     if ld_data:
-                        break
+                        title = ld_data.get('name')
+                    if not title:
+                        og_title = soup.find('meta', property='og:title') or soup.find('meta', attrs={'name': 'twitter:title'})
+                        title = og_title.get('content') if og_title else 'Etsy Item'
 
-                title = None
-                if ld_data:
-                    title = ld_data.get('name')
-                if not title:
-                    og_title = soup.find('meta', property='og:title') or soup.find('meta', attrs={'name': 'twitter:title'})
-                    title = og_title.get('content') if og_title else 'Etsy Item'
+                    price = "Check Site"
+                    if ld_data:
+                        offers = ld_data.get('offers', {})
+                        if isinstance(offers, list):
+                            offers = offers[0] if offers else {}
+                        price_val = offers.get('price')
+                        curr = offers.get('priceCurrency', 'USD')
+                        curr_sym = "$" if curr == "USD" else curr
+                        price = f"{curr_sym}{float(price_val):,.2f}" if price_val else "Check Site"
 
-                price = "Check Site"
-                if ld_data:
-                    offers = ld_data.get('offers', {})
-                    if isinstance(offers, list):
-                        offers = offers[0] if offers else {}
-                    price_val = offers.get('price')
-                    curr = offers.get('priceCurrency', 'USD')
-                    curr_sym = "$" if curr == "USD" else curr
-                    price = f"{curr_sym}{float(price_val):,.2f}" if price_val else "Check Site"
+                    img_url = extract_image_url(ld_data.get('image')) if ld_data else None
+                    if not img_url:
+                        og_image = soup.find('meta', property='og:image')
+                        img_url = og_image.get('content') if og_image else "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
 
-                img_url = extract_image_url(ld_data.get('image')) if ld_data else None
-                if not img_url:
-                    og_image = soup.find('meta', property='og:image')
-                    img_url = og_image.get('content') if og_image else "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
-
-                all_items.append({
-                    "Platform": "Etsy",
-                    "Rank": rank,
-                    "Preview": img_url,
-                    "Product Title": title.strip(),
-                    "Price": price,
-                    "Stock Status": "In Stock",
-                    "Link": listing_url
-                })
+                    all_items.append({
+                        "Platform": "Etsy",
+                        "Rank": rank,
+                        "Preview": img_url,
+                        "Product Title": title.strip(),
+                        "Price": price,
+                        "Stock Status": "In Stock",
+                        "Link": listing_url
+                    })
             except Exception as e:
                 continue
-        return all_items
+
+        # If ScraperAPI premium detail crawl/Google search failed to return items,
+        # fallback to directly scraping the Etsy search page and parsing it locally.
+        if not all_items:
+            target_url = f"https://www.etsy.com/search?q={keyword.replace(' ', '+')}"
+            html = fetch_page_html(target_url, provider, api_key)
+            if html:
+                return parse_etsy_search_html(html, limit)
+        else:
+            return all_items
 
     else:
         target_url = f"https://www.etsy.com/search?q={keyword.replace(' ', '+')}"
@@ -500,114 +526,15 @@ st.sidebar.write("---")
 
 st.sidebar.subheader("🛒 Store Selection")
 
-# Step 1: Initialize states in st.session_state on the very first run to manage values reliably
-if "platform_amazon" not in st.session_state:
-    st.session_state.platform_amazon = True
-if "platform_ebay" not in st.session_state:
-    st.session_state.platform_ebay = True
-if "platform_walmart" not in st.session_state:
-    st.session_state.platform_walmart = True
-if "platform_etsy" not in st.session_state:
-    st.session_state.platform_etsy = True
+# Render checkboxes with simple default values.
+# Removing 'key' parameters here stops Streamlit from force-locking checked states on.
+platform_amazon = st.sidebar.checkbox("Amazon Marketplace", value=True)
+platform_ebay = st.sidebar.checkbox("eBay Auctions", value=True)
+platform_walmart = st.sidebar.checkbox("Walmart E-Commerce", value=True)
+platform_etsy = st.sidebar.checkbox("Etsy Handmade & Vintage", value=True)
 
-# Step 2: Render checkboxes using ONLY the key attribute.
-# Crucially, omitting 'value=True' here prevents Streamlit from resetting the state back to True on reruns.
-st.sidebar.checkbox("Amazon Marketplace", key="platform_amazon")
-st.sidebar.checkbox("eBay Auctions", key="platform_ebay")
-st.sidebar.checkbox("Walmart E-Commerce", key="platform_walmart")
-st.sidebar.checkbox("Etsy Handmade & Vintage", key="platform_etsy")
-
-# Step 3: Access states directly from session_state keys
+# Build targets dynamically based on widget return variables
 target_platforms = []
-if st.session_state.platform_amazon:
+if platform_amazon:
     target_platforms.append("Amazon")
-if st.session_state.platform_ebay:
-    target_platforms.append("eBay")
-if st.session_state.platform_walmart:
-    target_platforms.append("Walmart")
-if st.session_state.platform_etsy:
-    target_platforms.append("Etsy")
-
-results_per_platform = st.sidebar.slider("Target Results Per Platform:", min_value=5, max_value=50, value=15, step=5)
-
-image_size = st.sidebar.slider(
-    "Row / Image Preview Size (px):",
-    min_value=35,
-    max_value=150,
-    value=80,
-    step=5,
-    help="Increase to make product preview images larger in the table below."
-)
-
-st.sidebar.write("---")
-
-st.title("📈 Enterprise E-Commerce Data Workspace")
-st.write("On-demand marketplace extraction engine for competitive intelligence and retail data sheets.")
-
-client_keyword = st.text_input("Enter Focus Product Keyword:", placeholder="e.g., Xiaomi phone")
-
-if st.button("⚡ Execute Automated Mining Sequence"):
-    if not target_platforms:
-        st.error("Please check at least one source channel in the settings sidebar.")
-    elif client_keyword:
-        with st.spinner(f"Processing deep channel indexing vectors via {api_provider}..."):
-
-            master_dataset = []
-
-            for platform in target_platforms:
-                if client_proxy_key:
-                    if platform == "Etsy":
-                        platform_data = scrape_etsy(
-                            keyword=client_keyword,
-                            api_key=client_proxy_key,
-                            limit=results_per_platform,
-                            provider=api_provider
-                        )
-                    else:
-                        platform_data = scrape_structured(
-                            keyword=client_keyword,
-                            platform=platform,
-                            api_key=client_proxy_key,
-                            limit=results_per_platform,
-                            provider=api_provider
-                        )
-                    master_dataset.extend(platform_data)
-                else:
-                    platform_data = run_legacy_fallback(client_keyword, platform, results_per_platform)
-                    master_dataset.extend(platform_data)
-
-            if master_dataset:
-                st.success(f"✨ Successfully compiled {len(master_dataset)} marketplace records!")
-
-                df = pd.DataFrame(master_dataset)
-
-                st.data_editor(
-                    df,
-                    column_config={
-                        "Preview": st.column_config.ImageColumn(
-                            "Preview",
-                            help="Live product display thumbnails",
-                            width=image_size
-                        ),
-                        "Product Title": st.column_config.TextColumn("Product Title", width="large"),
-                        "Price": st.column_config.TextColumn("Price", width="medium"),
-                        "Stock Status": st.column_config.TextColumn("Stock Status", width="medium"),
-                        "Link": st.column_config.LinkColumn("Website Link", display_text="Open Page", width="medium"),
-                    },
-                    use_container_width=True,
-                    disabled=True,
-                    row_height=image_size
-                )
-
-                csv_file = df.to_csv(index=False).encode('utf-8')
-                st.write("---")
-                st.download_button(
-                    label="📥 Export Compiled Excel/CSV Dataset",
-                    data=csv_file,
-                    file_name=f"{client_keyword.replace(' ', '_')}_market_intelligence.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.error("The API request returned no records from the active providers. Verify remaining credit balances or query limits.")
-    else:
-        st.error("Please enter a focus product keyword target to begin.")
+if platform
