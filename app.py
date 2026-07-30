@@ -58,7 +58,8 @@ def fetch_page_html(target_url, provider, api_key):
             'api_key': api_key,
             'url': target_url,
             'country_code': 'us',
-            'premium': 'true'
+            'premium': 'true',
+            'render': 'true'
         }
         try:
             resp = requests.get(SCRAPERAPI_ENDPOINT, params=payload, timeout=70)
@@ -71,7 +72,8 @@ def fetch_page_html(target_url, provider, api_key):
         payload = {
             'token': api_key,
             'url': target_url,
-            'super': 'true'  # Uses residential/premium proxies to bypass strict blocks
+            'super': 'true',  # Uses residential/premium proxies to bypass strict blocks
+            'render': 'true'  # REQUIRED for Walmart, Etsy, and eBay modern UI
         }
         try:
             resp = requests.get("https://api.scrape.do/", params=payload, timeout=70)
@@ -84,7 +86,9 @@ def fetch_page_html(target_url, provider, api_key):
         payload = {
             'api_key': api_key,
             'url': target_url,
-            'render_js': 'false'  # Set to false to consume only 1 credit per request
+            'render_js': 'True',       # REQUIRED for e-commerce parsing
+            'premium_proxy': 'True',   # Bypass WAFs
+            'country_code': 'us'
         }
         try:
             resp = requests.get("https://app.scrapingbee.com/api/v1/", params=payload, timeout=70)
@@ -173,18 +177,19 @@ def parse_ebay_search_html(html, limit=20):
 def parse_walmart_search_html(html, limit=20):
     soup = BeautifulSoup(html, 'html.parser')
     items = []
-    containers = soup.select('div[data-testid="item-card"]') or soup.select('[data-item-id]')
+    # Broaden selectors to handle various Walmart dynamic layouts
+    containers = soup.select('div[data-testid="item-card"]') or soup.select('[data-item-id]') or soup.select('.mb0.ph1.pa0-xl')
     rank = 1
     for container in containers:
-        title_el = container.select_one('[data-automation-id="product-title"]') or container.select_one('.w_iUH7')
+        title_el = container.select_one('[data-automation-id="product-title"]') or container.select_one('.w_iUH7') or container.select_one('span[data-automation-id="product-title"]')
         if not title_el:
             continue
         title = title_el.text.strip()
 
-        price_el = container.select_one('[data-automation-id="product-price"]') or container.select_one('.w_mSgX')
+        price_el = container.select_one('[data-automation-id="product-price"]') or container.select_one('.w_mSgX') or container.select_one('div[data-automation-id="product-price"]')
         price = price_el.text.strip().replace("current price ", "") if price_el else "Check Site"
 
-        img_el = container.select_one('img')
+        img_el = container.select_one('img[data-testid="productTileImage"]') or container.select_one('img')
         img_url = img_el.get('src') if img_el else "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
 
         link_el = container.select_one('a')
@@ -208,13 +213,14 @@ def parse_walmart_search_html(html, limit=20):
 def parse_etsy_search_html(html, limit=20):
     soup = BeautifulSoup(html, 'html.parser')
     items = []
+    # Broaden selectors to catch dynamic grid variations and JS components
     containers = soup.select('.search-listings-group-col .wt-list-unstyled li') or soup.select('.wt-grid .wt-list-unstyled li') or soup.select('.search-listings-group li')
     if not containers:
-        containers = soup.select('li.wt-list-unstyled') or soup.select('li[data-search-results-listing-card]') or soup.select('.v2-listing-card')
+        containers = soup.select('li.wt-list-unstyled') or soup.select('li[data-search-results-listing-card]') or soup.select('.v2-listing-card') or soup.select('div.v2-listing-card')
 
     rank = 1
     for container in containers:
-        title_el = container.select_one('h3.wt-text-caption') or container.select_one('.v2-listing-card__title') or container.select_one('h3')
+        title_el = container.select_one('h3.wt-text-caption') or container.select_one('.v2-listing-card__title') or container.select_one('h3') or container.select_one('h2')
         if not title_el:
             continue
         title = title_el.text.strip()
@@ -406,7 +412,7 @@ def scrape_etsy(keyword, api_key, limit=20, provider="ScraperAPI"):
 
         all_items = []
         for rank, listing_url in enumerate(listing_urls[:limit], start=1):
-            detail_payload = {'api_key': api_key, 'url': listing_url, 'country_code': 'us', 'premium': 'true'}
+            detail_payload = {'api_key': api_key, 'url': listing_url, 'country_code': 'us', 'premium': 'true', 'render': 'true'}
             try:
                 resp = requests.get(SCRAPERAPI_ENDPOINT, params=detail_payload, timeout=70)
                 if resp.status_code == 200:
@@ -458,6 +464,7 @@ def scrape_etsy(keyword, api_key, limit=20, provider="ScraperAPI"):
             except Exception as e:
                 continue
 
+        # Fallback to directly parsing search HTML if the detail extraction comes back empty
         if not all_items:
             target_url = f"https://www.etsy.com/search?q={keyword.replace(' ', '+')}"
             html = fetch_page_html(target_url, provider, api_key)
