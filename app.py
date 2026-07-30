@@ -112,49 +112,79 @@ def scrape_structured(keyword, platform, api_key, limit=20):
 
 # --- ETSY: TWO-STAGE SCRAPE ---
 # Etsy has no ScraperAPI structured endpoint, and its search/results grid is
-# one of the hardest pages on the site to render + get past anti-bot checks.
-# Instead we:
-#   Stage 1: render the search page just long enough to collect listing URLs.
+# one of the hardest pages on the site to render + get past anti-bot checks
+# (real 500s from ScraperAPI mean it genuinely lost that fight). Rather than
+# hammering Etsy's own search page directly, we discover listing URLs via a
+# much friendlier target -- Google's structured Search endpoint -- and only
+# fall back to Etsy's search page directly as a last resort.
+#   Stage 1a: query Google (site:etsy.com/listing KEYWORD) via ScraperAPI's
+#             structured Google Search endpoint for listing URLs.
+#   Stage 1b (fallback): render Etsy's own search page with premium=true.
 #   Stage 2: fetch each individual listing page (lighter target, no render
 #            needed) and pull the clean structured data Etsy embeds as
 #            schema.org JSON-LD in the page source.
-def scrape_etsy_two_stage(keyword, api_key, limit=20):
-    all_items = []
-    search_url = f'https://www.etsy.com/search?q={keyword.replace(" ", "+")}'
-
-    search_payload_variants = [
-        {'api_key': api_key, 'url': search_url, 'render': 'true', 'country_code': 'us', 'premium': 'true'},
-        {'api_key': api_key, 'url': search_url, 'render': 'true', 'country_code': 'us', 'ultra_premium': 'true'},
-    ]
-
-    listing_urls = []
-    for payload in search_payload_variants:
-        try:
-            resp = requests.get(SCRAPERAPI_ENDPOINT, params=payload, timeout=70)
-            if resp.status_code == 200:
-                found = re.findall(r'https://www\.etsy\.com/listing/\d+/[^"\'\s]+', resp.text)
-                seen = set()
-                for url in found:
-                    clean_url = url.split('?')[0]
+def discover_etsy_urls_via_google(keyword, api_key, limit):
+    payload = {
+        'api_key': api_key,
+        'query': f'site:etsy.com/listing {keyword}',
+        'country_code': 'us'
+    }
+    urls = []
+    try:
+        resp = requests.get("https://api.scraperapi.com/structured/google/search", params=payload, timeout=70)
+        if resp.status_code == 200:
+            data = resp.json()
+            seen = set()
+            for result in data.get("organic_results", []):
+                link = result.get("link", "")
+                if "etsy.com/listing" in link:
+                    clean_url = link.split('?')[0]
                     if clean_url not in seen:
                         seen.add(clean_url)
-                        listing_urls.append(clean_url)
-                if listing_urls:
-                    break
-            else:
-                st.sidebar.warning(f"ℹ️ Etsy search stage returned status: {resp.status_code}")
-        except Exception as e:
-            print(f"Error fetching Etsy search page: {e}")
-            continue
+                        urls.append(clean_url)
+        else:
+            st.sidebar.info(f"ℹ️ Etsy URL discovery via Google returned status: {resp.status_code}")
+    except Exception as e:
+        print(f"Error discovering Etsy listings via Google: {e}")
+    return urls[:limit]
+
+
+def discover_etsy_urls_direct(keyword, api_key, limit):
+    search_url = f'https://www.etsy.com/search?q={keyword.replace(" ", "+")}'
+    payload = {'api_key': api_key, 'url': search_url, 'render': 'true', 'country_code': 'us', 'premium': 'true'}
+    urls = []
+    try:
+        resp = requests.get(SCRAPERAPI_ENDPOINT, params=payload, timeout=70)
+        if resp.status_code == 200:
+            found = re.findall(r'https://www\.etsy\.com/listing/\d+/[^"\'\s]+', resp.text)
+            seen = set()
+            for url in found:
+                clean_url = url.split('?')[0]
+                if clean_url not in seen:
+                    seen.add(clean_url)
+                    urls.append(clean_url)
+        elif resp.status_code == 403:
+            st.sidebar.info("ℹ️ Etsy direct-search fallback returned 403 (feature not included on this ScraperAPI plan).")
+        else:
+            st.sidebar.warning(f"ℹ️ Etsy direct-search fallback returned status: {resp.status_code}")
+    except Exception as e:
+        print(f"Error fetching Etsy search page directly: {e}")
+    return urls[:limit]
+
+
+def scrape_etsy_two_stage(keyword, api_key, limit=20):
+    all_items = []
+
+    listing_urls = discover_etsy_urls_via_google(keyword, api_key, limit)
+    if not listing_urls:
+        listing_urls = discover_etsy_urls_direct(keyword, api_key, limit)
 
     if not listing_urls:
         st.sidebar.error(
-            "⚠️ Etsy search stage failed to return any listings (search grid blocked even after "
-            "premium/ultra_premium retries). Try again, or narrow the keyword."
+            "⚠️ Could not discover any Etsy listing URLs (Google discovery and the direct search "
+            "fallback both came up empty). Try again, or narrow the keyword."
         )
         return []
-
-    listing_urls = listing_urls[:limit]
 
     for rank, listing_url in enumerate(listing_urls, start=1):
         detail_payload = {'api_key': api_key, 'url': listing_url, 'country_code': 'us', 'premium': 'true'}
