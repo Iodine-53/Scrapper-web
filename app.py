@@ -331,7 +331,7 @@ def scrape_structured(keyword, platform, api_key, limit=20, provider="ScraperAPI
                 print(f"Error scraping structured {platform} via ScraperAPI: {e}")
                 continue
 
-        # --- AUTO-FALLBACK TO DIRECT CRAWLING FOR SCRAPERAPI ---
+        # --- AUTO-FALLBACK TO DIRECT HTML CRAWLING FOR SCRAPERAPI ---
         if platform == "Amazon":
             target_url = f"https://www.amazon.com/s?k={keyword.replace(' ', '+')}"
             html = fetch_page_html(target_url, "ScraperAPI", api_key)
@@ -458,8 +458,6 @@ def scrape_etsy(keyword, api_key, limit=20, provider="ScraperAPI"):
             except Exception as e:
                 continue
 
-        # If ScraperAPI detail crawl/Google search failed to return items,
-        # fallback to directly scraping the Etsy search page and parsing it locally.
         if not all_items:
             target_url = f"https://www.etsy.com/search?q={keyword.replace(' ', '+')}"
             html = fetch_page_html(target_url, provider, api_key)
@@ -505,7 +503,6 @@ st.set_page_config(page_title="Enterprise Market Scraper", page_icon="📈", lay
 st.sidebar.header("⚙️ System Configuration")
 st.sidebar.write("Configure your extraction credentials below.")
 
-# Active general proxy provider selector
 api_provider = st.sidebar.selectbox("Active Proxy Provider:", ["ScraperAPI", "Scrape.do", "ScrapingBee"])
 
 client_proxy_key = st.sidebar.text_input(
@@ -524,32 +521,31 @@ st.sidebar.write("---")
 
 st.sidebar.subheader("🛒 Store Selection")
 
-# Step 1: Initialize states in st.session_state on the very first run to manage values reliably
-if "platform_amazon" not in st.session_state:
-    st.session_state.platform_amazon = True
-if "platform_ebay" not in st.session_state:
-    st.session_state.platform_ebay = True
-if "platform_walmart" not in st.session_state:
-    st.session_state.platform_walmart = True
-if "platform_etsy" not in st.session_state:
-    st.session_state.platform_etsy = True
+# Initialize checkbox default values in session state (only runs once)
+if "chk_amazon" not in st.session_state:
+    st.session_state.chk_amazon = True
+if "chk_ebay" not in st.session_state:
+    st.session_state.chk_ebay = True
+if "chk_walmart" not in st.session_state:
+    st.session_state.chk_walmart = True
+if "chk_etsy" not in st.session_state:
+    st.session_state.chk_etsy = True
 
-# Step 2: Render checkboxes using ONLY the key attribute.
-# Crucially, omitting 'value=True' here prevents Streamlit from resetting the state back to True on reruns.
-st.sidebar.checkbox("Amazon Marketplace", key="platform_amazon")
-st.sidebar.checkbox("eBay Auctions", key="platform_ebay")
-st.sidebar.checkbox("Walmart E-Commerce", key="platform_walmart")
-st.sidebar.checkbox("Etsy Handmade & Vintage", key="platform_etsy")
+# Bind checkboxes exclusively to their state keys. 
+# This completely fixes the inability to check/uncheck them.
+platform_amazon = st.sidebar.checkbox("Amazon Marketplace", key="chk_amazon")
+platform_ebay = st.sidebar.checkbox("eBay Auctions", key="chk_ebay")
+platform_walmart = st.sidebar.checkbox("Walmart E-Commerce", key="chk_walmart")
+platform_etsy = st.sidebar.checkbox("Etsy Handmade & Vintage", key="chk_etsy")
 
-# Step 3: Access states directly from session_state keys
 target_platforms = []
-if st.session_state.platform_amazon:
+if platform_amazon:
     target_platforms.append("Amazon")
-if st.session_state.platform_ebay:
+if platform_ebay:
     target_platforms.append("eBay")
-if st.session_state.platform_walmart:
+if platform_walmart:
     target_platforms.append("Walmart")
-if st.session_state.platform_etsy:
+if platform_etsy:
     target_platforms.append("Etsy")
 
 results_per_platform = st.sidebar.slider("Target Results Per Platform:", min_value=5, max_value=50, value=15, step=5)
@@ -568,4 +564,70 @@ st.sidebar.write("---")
 st.title("📈 Enterprise E-Commerce Data Workspace")
 st.write("On-demand marketplace extraction engine for competitive intelligence and retail data sheets.")
 
-client_keyword = st.text_input("Enter Focus Product Keyword:", pla
+client_keyword = st.text_input("Enter Focus Product Keyword:", placeholder="e.g., Xiaomi phone")
+
+if st.button("⚡ Execute Automated Mining Sequence"):
+    if not target_platforms:
+        st.error("Please check at least one source channel in the settings sidebar.")
+    elif client_keyword:
+        with st.spinner(f"Processing deep channel indexing vectors via {api_provider}..."):
+
+            master_dataset = []
+
+            for platform in target_platforms:
+                if client_proxy_key:
+                    if platform == "Etsy":
+                        platform_data = scrape_etsy(
+                            keyword=client_keyword,
+                            api_key=client_proxy_key,
+                            limit=results_per_platform,
+                            provider=api_provider
+                        )
+                    else:
+                        platform_data = scrape_structured(
+                            keyword=client_keyword,
+                            platform=platform,
+                            api_key=client_proxy_key,
+                            limit=results_per_platform,
+                            provider=api_provider
+                        )
+                    master_dataset.extend(platform_data)
+                else:
+                    platform_data = run_legacy_fallback(client_keyword, platform, results_per_platform)
+                    master_dataset.extend(platform_data)
+
+            if master_dataset:
+                st.success(f"✨ Successfully compiled {len(master_dataset)} marketplace records!")
+
+                df = pd.DataFrame(master_dataset)
+
+                st.data_editor(
+                    df,
+                    column_config={
+                        "Preview": st.column_config.ImageColumn(
+                            "Preview",
+                            help="Live product display thumbnails",
+                            width=image_size
+                        ),
+                        "Product Title": st.column_config.TextColumn("Product Title", width="large"),
+                        "Price": st.column_config.TextColumn("Price", width="medium"),
+                        "Stock Status": st.column_config.TextColumn("Stock Status", width="medium"),
+                        "Link": st.column_config.LinkColumn("Website Link", display_text="Open Page", width="medium"),
+                    },
+                    use_container_width=True,
+                    disabled=True,
+                    row_height=image_size
+                )
+
+                csv_file = df.to_csv(index=False).encode('utf-8')
+                st.write("---")
+                st.download_button(
+                    label="📥 Export Compiled Excel/CSV Dataset",
+                    data=csv_file,
+                    file_name=f"{client_keyword.replace(' ', '_')}_market_intelligence.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.error("The API request returned no records from the active providers. Verify remaining credit balances or query limits.")
+    else:
+        st.error("Please enter a focus product keyword target to begin.")
