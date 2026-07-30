@@ -51,184 +51,359 @@ def find_product_node(data):
     return None
 
 
-# --- SCRAPERAPI ADAPTIVE ENGINE (Amazon / eBay / Walmart -> structured JSON) ---
-def scrape_structured(keyword, platform, api_key, limit=20):
+def fetch_page_html(target_url, provider, api_key, bd_zone="web_unlocker1"):
+    """
+    Unified helper to fetch raw HTML from any URL using the selected provider.
+    Supports ScraperAPI and Bright Data Web Unlocker.
+    """
+    if provider == "ScraperAPI":
+        payload = {
+            'api_key': api_key,
+            'url': target_url,
+            'country_code': 'us',
+            'premium': 'true'
+        }
+        try:
+            resp = requests.get(SCRAPERAPI_ENDPOINT, params=payload, timeout=70)
+            if resp.status_code == 200:
+                return resp.text
+        except Exception as e:
+            print(f"ScraperAPI error fetching {target_url}: {e}")
+            
+    elif provider == "Bright Data":
+        url = "https://api.brightdata.com/request"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        # Web Unlocker parameters
+        payload = {
+            "zone": bd_zone,
+            "url": target_url,
+            "format": "raw"
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=70)
+            if resp.status_code == 200:
+                return resp.text
+            else:
+                print(f"Bright Data request failed with status: {resp.status_code}")
+        except Exception as e:
+            print(f"Bright Data error fetching {target_url}: {e}")
+            
+    return None
+
+
+# --- BRIGHT DATA CUSTOM HTML PARSERS ---
+def parse_amazon_search_html(html, limit=20):
+    soup = BeautifulSoup(html, 'html.parser')
+    items = []
+    containers = soup.select('div[data-component-type="s-search-result"]')
+    if not containers:
+        containers = soup.select('.s-result-item')
+
+    rank = 1
+    for container in containers:
+        title_el = container.select_one('h2 a span') or container.select_one('.a-size-medium') or container.select_one('.a-size-base-plus')
+        if not title_el:
+            continue
+        title = title_el.text.strip()
+
+        price_el = container.select_one('.a-price .a-offscreen')
+        price = price_el.text.strip() if price_el else "Check Site"
+
+        img_el = container.select_one('img.s-image')
+        img_url = img_el.get('src') if img_el else "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
+
+        link_el = container.select_one('h2 a') or container.select_one('a.a-link-normal')
+        link = "https://www.amazon.com" + link_el.get('href') if link_el and link_el.get('href', '').startswith('/') else (link_el.get('href') if link_el else "#")
+
+        items.append({
+            "Platform": "Amazon",
+            "Rank": rank,
+            "Preview": img_url,
+            "Product Title": title,
+            "Price": price,
+            "Stock Status": "In Stock",
+            "Link": link
+        })
+        rank += 1
+        if rank > limit:
+            break
+    return items
+
+
+def parse_ebay_search_html(html, limit=20):
+    soup = BeautifulSoup(html, 'html.parser')
+    items = []
+    containers = soup.select('.srp-results .s-item') or soup.select('.s-item')
+    rank = 1
+    for container in containers:
+        title_el = container.select_one('.s-item__title')
+        if not title_el or "shop on ebay" in title_el.text.lower():
+            continue
+        title = title_el.text.strip()
+
+        price_el = container.select_one('.s-item__price')
+        price = price_el.text.strip() if price_el else "Check Site"
+
+        img_el = container.select_one('.s-item__image-img') or container.select_one('img')
+        img_url = img_el.get('src') or img_el.get('data-src') if img_el else "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
+
+        link_el = container.select_one('.s-item__link')
+        link = link_el.get('href').split('?')[0] if link_el and link_el.get('href') else "#"
+
+        items.append({
+            "Platform": "eBay",
+            "Rank": rank,
+            "Preview": img_url,
+            "Product Title": title,
+            "Price": price,
+            "Stock Status": "In Stock",
+            "Link": link
+        })
+        rank += 1
+        if rank > limit:
+            break
+    return items
+
+
+def parse_walmart_search_html(html, limit=20):
+    soup = BeautifulSoup(html, 'html.parser')
+    items = []
+    containers = soup.select('div[data-testid="item-card"]') or soup.select('[data-item-id]')
+    rank = 1
+    for container in containers:
+        title_el = container.select_one('[data-automation-id="product-title"]') or container.select_one('.w_iUH7')
+        if not title_el:
+            continue
+        title = title_el.text.strip()
+
+        price_el = container.select_one('[data-automation-id="product-price"]') or container.select_one('.w_mSgX')
+        price = price_el.text.strip().replace("current price ", "") if price_el else "Check Site"
+
+        img_el = container.select_one('img')
+        img_url = img_el.get('src') if img_el else "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
+
+        link_el = container.select_one('a')
+        link = "https://www.walmart.com" + link_el.get('href') if link_el and link_el.get('href', '').startswith('/') else (link_el.get('href') if link_el else "#")
+
+        items.append({
+            "Platform": "Walmart",
+            "Rank": rank,
+            "Preview": img_url,
+            "Product Title": title,
+            "Price": price,
+            "Stock Status": "In Stock",
+            "Link": link
+        })
+        rank += 1
+        if rank > limit:
+            break
+    return items
+
+
+# --- UNIFIED STRUCTURED ENGINE ---
+def scrape_structured(keyword, platform, api_key, limit=20, provider="ScraperAPI", bd_zone="web_unlocker1"):
     all_items = []
 
-    if platform == "Amazon":
-        endpoints = ["https://api.scraperapi.com/structured/amazon/search"]
-        payloads = [{'api_key': api_key, 'query': keyword, 'country_code': 'us'}]
+    if provider == "ScraperAPI":
+        if platform == "Amazon":
+            endpoints = ["https://api.scraperapi.com/structured/amazon/search"]
+            payloads = [{'api_key': api_key, 'query': keyword, 'country_code': 'us'}]
 
-    elif platform == "eBay":
-        endpoints = [
-            "https://api.scraperapi.com/structured/ebay/search",
-            "https://api.scraperapi.com/structured/ebay/search/v2"
-        ]
-        payloads = [{'api_key': api_key, 'query': keyword, 'country_code': 'us'}] * len(endpoints)
+        elif platform == "eBay":
+            endpoints = [
+                "https://api.scraperapi.com/structured/ebay/search",
+                "https://api.scraperapi.com/structured/ebay/search/v2"
+            ]
+            payloads = [{'api_key': api_key, 'query': keyword, 'country_code': 'us'}] * len(endpoints)
 
-    elif platform == "Walmart":
-        endpoints = ["https://api.scraperapi.com/structured/walmart/search"]
-        payloads = [{'api_key': api_key, 'query': keyword, 'country_code': 'us'}]
-    else:
-        return []
+        elif platform == "Walmart":
+            endpoints = ["https://api.scraperapi.com/structured/walmart/search"]
+            payloads = [{'api_key': api_key, 'query': keyword, 'country_code': 'us'}]
+        else:
+            return []
 
-    for endpoint, payload in zip(endpoints, payloads):
-        try:
-            response = requests.get(endpoint, params=payload, timeout=70)
-            if response.status_code == 200:
-                data = response.json()
+        for endpoint, payload in zip(endpoints, payloads):
+            try:
+                response = requests.get(endpoint, params=payload, timeout=70)
+                if response.status_code == 200:
+                    data = response.json()
 
-                # Different platforms nest results under different top-level keys:
-                if isinstance(data, list):
-                    results = data
-                else:
-                    raw_results = (
-                        data.get("items", [])
-                        or data.get("results", [])
-                        or data.get("item_results", [])
-                    )
-                    if isinstance(raw_results, dict):
-                        results = raw_results.get("listings", []) or raw_results.get("results", [])
+                    if isinstance(data, list):
+                        results = data
                     else:
-                        results = raw_results if isinstance(raw_results, list) else []
+                        raw_results = (
+                            data.get("items", [])
+                            or data.get("results", [])
+                            or data.get("item_results", [])
+                        )
+                        if isinstance(raw_results, dict):
+                            results = raw_results.get("listings", []) or raw_results.get("results", [])
+                        else:
+                            results = raw_results if isinstance(raw_results, list) else []
 
-                valid_rank = 1
-                for item in results:
-                    title = item.get("name") or item.get("title") or item.get("product_title")
-                    if not title:
-                        continue
+                    valid_rank = 1
+                    for item in results:
+                        title = item.get("name") or item.get("title") or item.get("product_title")
+                        if not title:
+                            continue
 
-                    price_raw = item.get("price") or item.get("price_string") or item.get("item_price") or item.get("min_price")
-                    if isinstance(price_raw, dict):
-                        val = price_raw.get("value") or price_raw.get("amount")
-                        curr = price_raw.get("currency", "$")
-                        curr_sym = "$" if curr == "USD" else curr
-                        price = f"{curr_sym}{val:,.2f}" if val else "Check Site"
-                    elif isinstance(price_raw, (int, float)):
-                        price = f"${price_raw:,.2f}"
-                    else:
-                        price = str(price_raw) if price_raw else "Check Site"
+                        price_raw = item.get("price") or item.get("price_string") or item.get("item_price") or item.get("min_price")
+                        if isinstance(price_raw, dict):
+                            val = price_raw.get("value") or price_raw.get("amount")
+                            curr = price_raw.get("currency", "$")
+                            curr_sym = "$" if curr == "USD" else curr
+                            price = f"{curr_sym}{val:,.2f}" if val else "Check Site"
+                        elif isinstance(price_raw, (int, float)):
+                            price = f"${price_raw:,.2f}"
+                        else:
+                            price = str(price_raw) if price_raw else "Check Site"
 
-                    img_url = item.get("image") or item.get("thumbnail") or item.get("primary_image") or "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
-                    availability = item.get("availability") or item.get("stock_status") or item.get("inventory_status") or "In Stock"
+                        img_url = item.get("image") or item.get("thumbnail") or item.get("primary_image") or "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
+                        availability = item.get("availability") or item.get("stock_status") or item.get("inventory_status") or "In Stock"
 
-                    fallback_urls = {
-                        "eBay": f"https://www.ebay.com/sch/i.html?_nkw={keyword}",
-                        "Amazon": f"https://www.amazon.com/s?k={keyword}",
-                        "Walmart": f"https://www.walmart.com/search?q={keyword}"
-                    }
-                    fallback_url = fallback_urls.get(platform, "https://www.google.com")
-                    item_link = item.get("url") or item.get("link") or item.get("product_url") or item.get("product_page_url") or fallback_url
+                        fallback_urls = {
+                            "eBay": f"https://www.ebay.com/sch/i.html?_nkw={keyword}",
+                            "Amazon": f"https://www.amazon.com/s?k={keyword}",
+                            "Walmart": f"https://www.walmart.com/search?q={keyword}"
+                        }
+                        fallback_url = fallback_urls.get(platform, "https://www.google.com")
+                        item_link = item.get("url") or item.get("link") or item.get("product_url") or item.get("product_page_url") or fallback_url
 
-                    all_items.append({
-                        "Platform": platform,
-                        "Rank": valid_rank,
-                        "Preview": img_url,
-                        "Product Title": title.strip(),
-                        "Price": price,
-                        "Stock Status": availability.replace("_", " ").title() if isinstance(availability, str) else "In Stock",
-                        "Link": item_link
-                    })
+                        all_items.append({
+                            "Platform": platform,
+                            "Rank": valid_rank,
+                            "Preview": img_url,
+                            "Product Title": title.strip(),
+                            "Price": price,
+                            "Stock Status": availability.replace("_", " ").title() if isinstance(availability, str) else "In Stock",
+                            "Link": item_link
+                        })
 
-                    valid_rank += 1
-                    if valid_rank > limit:
-                        break
+                        valid_rank += 1
+                        if valid_rank > limit:
+                            break
 
-                if all_items:
-                    break  # Skip alternative endpoints on success
-            else:
-                if response.status_code == 500:
-                    st.sidebar.error(
-                        f"⚠️ {platform} returned status 500 (Internal Server Error). "
-                        f"This can happen due to strict anti-bot blockages or invalid keyword query redirects."
-                    )
+                    if all_items:
+                        break  # Skip alternative endpoints on success
                 else:
-                    st.sidebar.warning(f"ℹ️ {platform} returned status: {response.status_code}")
+                    if response.status_code == 500:
+                        st.sidebar.error(
+                            f"⚠️ {platform} returned status 500 (Internal Server Error). "
+                            f"This can happen due to strict anti-bot blockages or invalid keyword query redirects."
+                        )
+                    else:
+                        st.sidebar.warning(f"ℹ️ {platform} returned status: {response.status_code}")
 
-        except Exception as e:
-            print(f"Error scraping {platform}: {e}")
-            continue
+            except Exception as e:
+                print(f"Error scraping {platform}: {e}")
+                continue
+
+    elif provider == "Bright Data":
+        if platform == "Amazon":
+            url = f"https://www.amazon.com/s?k={keyword.replace(' ', '+')}"
+            html = fetch_page_html(url, provider, api_key, bd_zone)
+            if html:
+                return parse_amazon_search_html(html, limit)
+        elif platform == "eBay":
+            url = f"https://www.ebay.com/sch/i.html?_nkw={keyword.replace(' ', '+')}"
+            html = fetch_page_html(url, provider, api_key, bd_zone)
+            if html:
+                return parse_ebay_search_html(html, limit)
+        elif platform == "Walmart":
+            url = f"https://www.walmart.com/search?q={keyword.replace(' ', '+')}"
+            html = fetch_page_html(url, provider, api_key, bd_zone)
+            if html:
+                return parse_walmart_search_html(html, limit)
 
     return all_items
 
 
 # --- ETSY: TWO-STAGE SCRAPE ---
-def discover_etsy_urls_via_google(keyword, api_key, limit):
-    payload = {
-        'api_key': api_key,
-        'query': f'site:etsy.com/listing {keyword}',
-        'country_code': 'us'
-    }
+def discover_etsy_urls_via_google(keyword, api_key, limit, provider="ScraperAPI", bd_zone="web_unlocker1"):
     urls = []
-    try:
-        resp = requests.get("https://api.scraperapi.com/structured/google/search", params=payload, timeout=70)
-        if resp.status_code == 200:
-            data = resp.json()
+    if provider == "ScraperAPI":
+        payload = {
+            'api_key': api_key,
+            'query': f'site:etsy.com/listing {keyword}',
+            'country_code': 'us'
+        }
+        try:
+            resp = requests.get("https://api.scraperapi.com/structured/google/search", params=payload, timeout=70)
+            if resp.status_code == 200:
+                data = resp.json()
+                seen = set()
+                for result in data.get("organic_results", []):
+                    link = result.get("link", "")
+                    if "etsy.com/listing" in link:
+                        clean_url = link.split('?')[0]
+                        if clean_url not in seen:
+                            seen.add(clean_url)
+                            urls.append(clean_url)
+            else:
+                st.sidebar.info(f"ℹ️ Etsy URL discovery via Google returned status: {resp.status_code}")
+        except Exception as e:
+            print(f"Error discovering Etsy listings via Google: {e}")
+            
+    elif provider == "Bright Data":
+        url = f"https://www.google.com/search?q=site:etsy.com/listing+{keyword.replace(' ', '+')}"
+        html = fetch_page_html(url, provider, api_key, bd_zone)
+        if html:
+            soup = BeautifulSoup(html, 'html.parser')
             seen = set()
-            for result in data.get("organic_results", []):
-                link = result.get("link", "")
-                if "etsy.com/listing" in link:
-                    clean_url = link.split('?')[0]
-                    if clean_url not in seen:
-                        seen.add(clean_url)
-                        urls.append(clean_url)
-        else:
-            st.sidebar.info(f"ℹ️ Etsy URL discovery via Google returned status: {resp.status_code}")
-    except Exception as e:
-        print(f"Error discovering Etsy listings via Google: {e}")
+            for a in soup.select('a'):
+                href = a.get('href', '')
+                if "etsy.com/listing" in href:
+                    match = re.search(r'https://www\.etsy\.com/listing/\d+[^&]*', href)
+                    if match:
+                        clean_url = match.group(0).split('?')[0]
+                        if clean_url not in seen:
+                            seen.add(clean_url)
+                            urls.append(clean_url)
     return urls[:limit]
 
 
-def discover_etsy_urls_direct(keyword, api_key, limit):
+def discover_etsy_urls_direct(keyword, api_key, limit, provider="ScraperAPI", bd_zone="web_unlocker1"):
     search_url = f'https://www.etsy.com/search?q={keyword.replace(" ", "+")}'
-    payload = {'api_key': api_key, 'url': search_url, 'render': 'true', 'country_code': 'us', 'premium': 'true'}
+    html = fetch_page_html(search_url, provider, api_key, bd_zone)
     urls = []
-    try:
-        resp = requests.get(SCRAPERAPI_ENDPOINT, params=payload, timeout=70)
-        if resp.status_code == 200:
-            # Match both unescaped and escaped Etsy listing URLs
-            found = re.findall(r'https://www\.etsy\.com/listing/\d+(?:/[^"\'\s\\%]+)?', resp.text)
-            found_escaped = re.findall(r'https:\\/\\/www\.etsy\.com\\/listing\\/\d+(?:\\/[^"\'\s\\+d]+)?', resp.text)
-            for url in found_escaped:
-                found.append(url.replace('\\/', '/'))
+    if html:
+        found = re.findall(r'https://www\.etsy\.com/listing/\d+(?:/[^"\'\s\\%]+)?', html)
+        found_escaped = re.findall(r'https:\\/\\/www\.etsy\.com\\/listing\\/\d+(?:\\/[^"\'\s\\]+)?', html)
+        for url in found_escaped:
+            found.append(url.replace('\\/', '/'))
 
-            seen = set()
-            for url in found:
-                clean_url = url.split('?')[0]
-                if clean_url not in seen:
-                    seen.add(clean_url)
-                    urls.append(clean_url)
-        elif resp.status_code == 403:
-            st.sidebar.info("ℹ️ Etsy direct-search fallback returned 403 (feature not included on this ScraperAPI plan).")
-        else:
-            st.sidebar.warning(f"ℹ️ Etsy direct-search fallback returned status: {resp.status_code}")
-    except Exception as e:
-        print(f"Error fetching Etsy search page directly: {e}")
+        seen = set()
+        for url in found:
+            clean_url = url.split('?')[0]
+            if clean_url not in seen:
+                seen.add(clean_url)
+                urls.append(clean_url)
     return urls[:limit]
 
 
-def scrape_etsy_two_stage(keyword, api_key, limit=20):
+def scrape_etsy_two_stage(keyword, api_key, limit=20, provider="ScraperAPI", bd_zone="web_unlocker1"):
     all_items = []
 
-    listing_urls = discover_etsy_urls_via_google(keyword, api_key, limit)
+    listing_urls = discover_etsy_urls_via_google(keyword, api_key, limit, provider, bd_zone)
     if not listing_urls:
-        listing_urls = discover_etsy_urls_direct(keyword, api_key, limit)
+        listing_urls = discover_etsy_urls_direct(keyword, api_key, limit, provider, bd_zone)
 
     if not listing_urls:
         st.sidebar.error(
-            "⚠️ Could not discover any Etsy listing URLs (Google discovery and the direct search "
-            "fallback both came up empty). Try again, or narrow the keyword."
+            "⚠️ Could not discover any Etsy listing URLs. Try again, or narrow the keyword."
         )
         return []
 
     for rank, listing_url in enumerate(listing_urls, start=1):
-        detail_payload = {'api_key': api_key, 'url': listing_url, 'country_code': 'us', 'premium': 'true'}
         try:
-            resp = requests.get(SCRAPERAPI_ENDPOINT, params=detail_payload, timeout=70)
-            if resp.status_code != 200:
+            html = fetch_page_html(listing_url, provider, api_key, bd_zone)
+            if not html:
                 continue
 
-            soup = BeautifulSoup(resp.text, 'html.parser')
+            soup = BeautifulSoup(html, 'html.parser')
             
             # Extract JSON-LD
             ld_data = None
@@ -351,10 +526,10 @@ def scrape_etsy_two_stage(keyword, api_key, limit=20):
     return all_items
 
 
-def scrape_via_scraperapi(keyword, platform, api_key, limit=20):
+def scrape_via_provider(keyword, platform, provider, api_key, limit=20, bd_zone="web_unlocker1"):
     if platform == "Etsy":
-        return scrape_etsy_two_stage(keyword, api_key, limit)
-    return scrape_structured(keyword, platform, api_key, limit)
+        return scrape_etsy_two_stage(keyword, api_key, limit, provider, bd_zone)
+    return scrape_structured(keyword, platform, api_key, limit, provider, bd_zone)
 
 
 # --- RENDER BACKUP SYSTEM VECTOR (DOCK DATA FOR OFFLINE DEMOS) ---
@@ -384,15 +559,27 @@ st.set_page_config(page_title="Enterprise Market Scraper", page_icon="📈", lay
 st.sidebar.header("⚙️ System Configuration")
 st.sidebar.write("Configure your extraction credentials below.")
 
+# Active proxy provider selector
+api_provider = st.sidebar.selectbox("Active Proxy Provider:", ["ScraperAPI", "Bright Data"])
+
 client_proxy_key = st.sidebar.text_input(
-    "Premium Proxy API Key:",
+    f"Paste {api_provider} API Key / Token:",
     type="password",
-    placeholder="Paste ScraperAPI key here...",
+    placeholder="Paste API credential here...",
     key="proxy_api_key_input"
 )
 
+# Render zone customization specifically when Bright Data is chosen
+bd_zone = "web_unlocker1"
+if api_provider == "Bright Data":
+    bd_zone = st.sidebar.text_input(
+        "Bright Data Web Unlocker Zone:",
+        value="web_unlocker1",
+        help="The zone name configured in your Bright Data control panel (e.g., 'web_unlocker1')."
+    )
+
 if client_proxy_key:
-    st.sidebar.success("✅ Deep Matrix Direct Routing Active.")
+    st.sidebar.success(f"✅ {api_provider} Direct Routing Active.")
 else:
     st.sidebar.warning("⚠️ Running via offline legacy mode (No Live Metrics).")
 
@@ -438,17 +625,19 @@ if st.button("⚡ Execute Automated Mining Sequence"):
     if not target_platforms:
         st.error("Please check at least one source channel in the settings sidebar.")
     elif client_keyword:
-        with st.spinner("Processing deep channel indexing vectors via ScraperAPI..."):
+        with st.spinner(f"Processing deep channel indexing vectors via {api_provider}..."):
 
             master_dataset = []
 
             for platform in target_platforms:
                 if client_proxy_key:
-                    platform_data = scrape_via_scraperapi(
+                    platform_data = scrape_via_provider(
                         keyword=client_keyword,
                         platform=platform,
+                        provider=api_provider,
                         api_key=client_proxy_key,
-                        limit=results_per_platform
+                        limit=results_per_platform,
+                        bd_zone=bd_zone
                     )
                     master_dataset.extend(platform_data)
                 else:
@@ -487,6 +676,6 @@ if st.button("⚡ Execute Automated Mining Sequence"):
                     mime="text/csv"
                 )
             else:
-                st.error("The API request returned no records from the active providers. Verify remaining credit balances.")
+                st.error("The API request returned no records from the active providers. Verify remaining credit balances or query limits.")
     else:
         st.error("Please enter a focus product keyword target to begin.")
