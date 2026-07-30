@@ -47,102 +47,209 @@ def find_product_node(data):
     return None
 
 
-# --- BRIGHT DATA DATASETS WEB SCRAPER API HOOKS ---
-def fetch_brightdata_dataset(dataset_id, api_key, input_payload):
+# --- GENERAL PURPOSE HTML FETCH ROUTER ---
+def fetch_page_html(target_url, provider, api_key):
     """
-    Call Bright Data Web Scraper API synchronously to retrieve structured JSON.
+    Unified helper to fetch raw HTML from any URL using a selected general-purpose provider.
+    Supports ScraperAPI, Scrape.do, and ScrapingBee.
     """
-    url = f"https://api.brightdata.com/datasets/v3/scrape?dataset_id={dataset_id}&format=json"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    try:
-        response = requests.post(url, headers=headers, json=input_payload, timeout=90)
-        if response.status_code == 200:
-            return response.json()
-        elif response.status_code == 202:
-            st.sidebar.warning("⏳ Snapshot processing in progress. Try running the mining sequence again.")
-        else:
-            st.sidebar.error(f"⚠️ Bright Data API returned: {response.status_code} - {response.text}")
-    except Exception as e:
-        print(f"Error calling Bright Data Datasets API: {e}")
+    if provider == "ScraperAPI":
+        payload = {
+            'api_key': api_key,
+            'url': target_url,
+            'country_code': 'us',
+            'premium': 'true'
+        }
+        try:
+            resp = requests.get(SCRAPERAPI_ENDPOINT, params=payload, timeout=70)
+            if resp.status_code == 200:
+                return resp.text
+        except Exception as e:
+            print(f"ScraperAPI error fetching {target_url}: {e}")
+            
+    elif provider == "Scrape.do":
+        payload = {
+            'token': api_key,
+            'url': target_url,
+            'super': 'true'  # Uses residential/premium proxies to bypass strict blocks
+        }
+        try:
+            resp = requests.get("https://api.scrape.do/", params=payload, timeout=70)
+            if resp.status_code == 200:
+                return resp.text
+        except Exception as e:
+            print(f"Scrape.do error fetching {target_url}: {e}")
+            
+    elif provider == "ScrapingBee":
+        payload = {
+            'api_key': api_key,
+            'url': target_url,
+            'render_js': 'false'  # Set to false to consume only 1 credit per request
+        }
+        try:
+            resp = requests.get("https://app.scrapingbee.com/api/v1/", params=payload, timeout=70)
+            if resp.status_code == 200:
+                return resp.text
+        except Exception as e:
+            print(f"ScrapingBee error fetching {target_url}: {e}")
+            
     return None
 
 
-def map_brightdata_results(results, platform, limit):
-    """
-    Map the structured JSON schema returned by Bright Data into our unified table format.
-    """
-    mapped_items = []
-    if not results or not isinstance(results, list):
-        return []
+# --- GENERAL PURPOSE HTML SEARCH PARSERS ---
+def parse_amazon_search_html(html, limit=20):
+    soup = BeautifulSoup(html, 'html.parser')
+    items = []
+    containers = soup.select('div[data-component-type="s-search-result"]')
+    if not containers:
+        containers = soup.select('.s-result-item')
 
-    valid_rank = 1
-    for item in results:
-        title = (
-            item.get("title")
-            or item.get("name")
-            or item.get("product_name")
-            or item.get("product_title")
-        )
-        if not title:
+    rank = 1
+    for container in containers:
+        title_el = container.select_one('h2 a span') or container.select_one('.a-size-medium') or container.select_one('.a-size-base-plus')
+        if not title_el:
             continue
+        title = title_el.text.strip()
 
-        price_raw = (
-            item.get("price")
-            or item.get("final_price")
-            or item.get("price_string")
-            or item.get("item_price")
-        )
-        if isinstance(price_raw, (int, float)):
-            price = f"${price_raw:,.2f}"
-        else:
-            price = str(price_raw) if price_raw else "Check Site"
+        price_el = container.select_one('.a-price .a-offscreen')
+        price = price_el.text.strip() if price_el else "Check Site"
 
-        img_url = (
-            item.get("main_image")
-            or item.get("image")
-            or item.get("thumbnail")
-            or item.get("primary_image")
-            or (item.get("image_urls")[0] if isinstance(item.get("image_urls"), list) and item.get("image_urls") else None)
-            or "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
-        )
-        
-        availability = (
-            item.get("availability")
-            or item.get("stock_status")
-            or "In Stock"
-        )
+        img_el = container.select_one('img.s-image')
+        img_url = img_el.get('src') if img_el else "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
 
-        item_link = (
-            item.get("url")
-            or item.get("link")
-            or item.get("product_url")
-            or "#"
-        )
+        link_el = container.select_one('h2 a') or container.select_one('a.a-link-normal')
+        link = "https://www.amazon.com" + link_el.get('href') if link_el and link_el.get('href', '').startswith('/') else (link_el.get('href') if link_el else "#")
 
-        mapped_items.append({
-            "Platform": platform,
-            "Rank": valid_rank,
+        items.append({
+            "Platform": "Amazon",
+            "Rank": rank,
             "Preview": img_url,
-            "Product Title": title.strip(),
+            "Product Title": title,
             "Price": price,
-            "Stock Status": availability.replace("_", " ").title() if isinstance(availability, str) else "In Stock",
-            "Link": item_link
+            "Stock Status": "In Stock",
+            "Link": link
         })
-
-        valid_rank += 1
-        if valid_rank > limit:
+        rank += 1
+        if rank > limit:
             break
+    return items
 
-    return mapped_items
+
+def parse_ebay_search_html(html, limit=20):
+    soup = BeautifulSoup(html, 'html.parser')
+    items = []
+    containers = soup.select('.srp-results .s-item') or soup.select('.s-item')
+    rank = 1
+    for container in containers:
+        title_el = container.select_one('.s-item__title')
+        if not title_el or "shop on ebay" in title_el.text.lower():
+            continue
+        title = title_el.text.strip()
+
+        price_el = container.select_one('.s-item__price')
+        price = price_el.text.strip() if price_el else "Check Site"
+
+        img_el = container.select_one('.s-item__image-img') or container.select_one('img')
+        img_url = img_el.get('src') or img_el.get('data-src') if img_el else "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
+
+        link_el = container.select_one('.s-item__link')
+        link = link_el.get('href').split('?')[0] if link_el and link_el.get('href') else "#"
+
+        items.append({
+            "Platform": "eBay",
+            "Rank": rank,
+            "Preview": img_url,
+            "Product Title": title,
+            "Price": price,
+            "Stock Status": "In Stock",
+            "Link": link
+        })
+        rank += 1
+        if rank > limit:
+            break
+    return items
 
 
-# --- SCRAPERAPI ADAPTIVE ENGINE ---
-def scrape_structured(keyword, platform, api_key, limit=20, provider="ScraperAPI", dataset_id=None):
-    all_items = []
+def parse_walmart_search_html(html, limit=20):
+    soup = BeautifulSoup(html, 'html.parser')
+    items = []
+    containers = soup.select('div[data-testid="item-card"]') or soup.select('[data-item-id]')
+    rank = 1
+    for container in containers:
+        title_el = container.select_one('[data-automation-id="product-title"]') or container.select_one('.w_iUH7')
+        if not title_el:
+            continue
+        title = title_el.text.strip()
 
+        price_el = container.select_one('[data-automation-id="product-price"]') or container.select_one('.w_mSgX')
+        price = price_el.text.strip().replace("current price ", "") if price_el else "Check Site"
+
+        img_el = container.select_one('img')
+        img_url = img_el.get('src') if img_el else "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
+
+        link_el = container.select_one('a')
+        link = "https://www.walmart.com" + link_el.get('href') if link_el and link_el.get('href', '').startswith('/') else (link_el.get('href') if link_el else "#")
+
+        items.append({
+            "Platform": "Walmart",
+            "Rank": rank,
+            "Preview": img_url,
+            "Product Title": title,
+            "Price": price,
+            "Stock Status": "In Stock",
+            "Link": link
+        })
+        rank += 1
+        if rank > limit:
+            break
+    return items
+
+
+def parse_etsy_search_html(html, limit=20):
+    soup = BeautifulSoup(html, 'html.parser')
+    items = []
+    containers = soup.select('.search-listings-group-col .wt-list-unstyled li') or soup.select('.wt-grid .wt-list-unstyled li')
+    if not containers:
+        containers = soup.select('li.wt-list-unstyled')
+
+    rank = 1
+    for container in containers:
+        title_el = container.select_one('h3.wt-text-caption') or container.select_one('.v2-listing-card__title')
+        if not title_el:
+            continue
+        title = title_el.text.strip()
+
+        price_el = container.select_one('.lc-price') or container.select_one('.currency-value') or container.select_one('.n-listing-card__price')
+        price = price_el.text.strip() if price_el else "Check Site"
+
+        img_el = container.select_one('img')
+        img_url = "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
+        if img_el:
+            img_url = img_el.get('src') or img_el.get('data-src') or img_el.get('data-origin-src') or img_url
+
+        link_el = container.select_one('a.listing-link') or container.select_one('a')
+        link = link_el.get('href').split('?')[0] if link_el and link_el.get('href') else "#"
+        if link.startswith('/'):
+            link = "https://www.etsy.com" + link
+
+        items.append({
+            "Platform": "Etsy",
+            "Rank": rank,
+            "Preview": img_url,
+            "Product Title": title,
+            "Price": price,
+            "Stock Status": "In Stock",
+            "Link": link
+        })
+        rank += 1
+        if rank > limit:
+            break
+    return items
+
+
+# --- PLATFORM SEARCH ROUTER ---
+def scrape_structured(keyword, platform, api_key, limit=20, provider="ScraperAPI"):
+    # If using ScraperAPI, use their structured JSON search endpoints for high efficiency
     if provider == "ScraperAPI":
         if platform == "Amazon":
             endpoints = ["https://api.scraperapi.com/structured/amazon/search"]
@@ -178,6 +285,7 @@ def scrape_structured(keyword, platform, api_key, limit=20, provider="ScraperAPI
                             results = raw_results if isinstance(raw_results, list) else []
 
                     valid_rank = 1
+                    all_items = []
                     for item in results:
                         title = item.get("name") or item.get("title") or item.get("product_title")
                         if not title:
@@ -219,124 +327,73 @@ def scrape_structured(keyword, platform, api_key, limit=20, provider="ScraperAPI
                         if valid_rank > limit:
                             break
                     if all_items:
-                        break
+                        return all_items
             except Exception as e:
-                print(f"Error scraping {platform} via ScraperAPI: {e}")
+                print(f"Error scraping structured {platform} via ScraperAPI: {e}")
                 continue
 
-    elif provider == "Bright Data (Web Scraper API)":
-        if not dataset_id:
-            return []
-
+    # If using Scrape.do or ScrapingBee, fetch raw search HTML and parse on the fly
+    else:
         if platform == "Amazon":
             target_url = f"https://www.amazon.com/s?k={keyword.replace(' ', '+')}"
+            html = fetch_page_html(target_url, provider, api_key)
+            if html:
+                return parse_amazon_search_html(html, limit)
         elif platform == "eBay":
             target_url = f"https://www.ebay.com/sch/i.html?_nkw={keyword.replace(' ', '+')}"
+            html = fetch_page_html(target_url, provider, api_key)
+            if html:
+                return parse_ebay_search_html(html, limit)
         elif platform == "Walmart":
             target_url = f"https://www.walmart.com/search?q={keyword.replace(' ', '+')}"
-        else:
-            return []
+            html = fetch_page_html(target_url, provider, api_key)
+            if html:
+                return parse_walmart_search_html(html, limit)
 
-        # Matches the format from your successful curl command
+    return []
+
+
+# --- ETSY DIRECT SEARCH OR SCAPERAPI DISCOVERY ---
+def scrape_etsy(keyword, api_key, limit=20, provider="ScraperAPI"):
+    # ScraperAPI uses its optimized two-stage detail logic
+    if provider == "ScraperAPI":
+        # Discover listing links via google search endpoint
         payload = {
-            "input": [{"url": target_url}],
-            "limit_per_input": None
+            'api_key': api_key,
+            'query': f'site:etsy.com/listing {keyword}',
+            'country_code': 'us'
         }
-        results = fetch_brightdata_dataset(dataset_id, api_key, payload)
-        if results:
-            return map_brightdata_results(results, platform, limit)
-
-    return all_items
-
-
-# --- ETSY: TWO-STAGE SCRAPE ---
-def discover_etsy_urls_via_google(keyword, api_key, limit):
-    payload = {
-        'api_key': api_key,
-        'query': f'site:etsy.com/listing {keyword}',
-        'country_code': 'us'
-    }
-    urls = []
-    try:
-        resp = requests.get("https://api.scraperapi.com/structured/google/search", params=payload, timeout=70)
-        if resp.status_code == 200:
-            data = resp.json()
-            seen = set()
-            for result in data.get("organic_results", []):
-                link = result.get("link", "")
-                if "etsy.com/listing" in link:
-                    clean_url = link.split('?')[0]
-                    if clean_url not in seen:
-                        seen.add(clean_url)
-                        urls.append(clean_url)
-    except Exception as e:
-        print(f"Error discovering Etsy listings via Google: {e}")
-    return urls[:limit]
-
-
-def discover_etsy_urls_via_google_bd(keyword, api_key, dataset_id, limit):
-    target_url = f"https://www.google.com/search?q=site:etsy.com/listing+{keyword.replace(' ', '+')}"
-    payload = {
-        "input": [{"url": target_url}],
-        "limit_per_input": None
-    }
-    urls = []
-    try:
-        results = fetch_brightdata_dataset(dataset_id, api_key, payload)
-        if results and isinstance(results, list):
-            seen = set()
-            for result in results:
-                organic_results = result.get("organic", []) or result.get("results", []) or []
-                if not organic_results and isinstance(result, dict):
-                    organic_results = [result]
-                for item in organic_results:
-                    link = item.get("link") or item.get("url") or ""
+        listing_urls = []
+        try:
+            resp = requests.get("https://api.scraperapi.com/structured/google/search", params=payload, timeout=70)
+            if resp.status_code == 200:
+                data = resp.json()
+                seen = set()
+                for result in data.get("organic_results", []):
+                    link = result.get("link", "")
                     if "etsy.com/listing" in link:
                         clean_url = link.split('?')[0]
                         if clean_url not in seen:
                             seen.add(clean_url)
-                            urls.append(clean_url)
-    except Exception as e:
-        print(f"Error discovering Etsy listings via Bright Data Google Scraper: {e}")
-    return urls[:limit]
+                            listing_urls.append(clean_url)
+        except Exception as e:
+            print(f"Etsy discovery failed: {e}")
 
-
-def discover_etsy_urls_direct(keyword, api_key, limit):
-    search_url = f'https://www.etsy.com/search?q={keyword.replace(" ", "+")}'
-    payload = {'api_key': api_key, 'url': search_url, 'render': 'true', 'country_code': 'us', 'premium': 'true'}
-    urls = []
-    try:
-        resp = requests.get(SCRAPERAPI_ENDPOINT, params=payload, timeout=70)
-        if resp.status_code == 200:
-            found = re.findall(r'https://www\.etsy\.com/listing/\d+(?:/[^"\'\s\\%]+)?', resp.text)
-            found_escaped = re.findall(r'https:\\/\\/www\.etsy\.com\\/listing\\/\d+(?:\\/[^"\'\s\\]+)?', resp.text)
-            for url in found_escaped:
-                found.append(url.replace('\\/', '/'))
-
-            seen = set()
-            for url in found:
-                clean_url = url.split('?')[0]
-                if clean_url not in seen:
-                    seen.add(clean_url)
-                    urls.append(clean_url)
-    except Exception as e:
-        print(f"Error fetching Etsy search page directly: {e}")
-    return urls[:limit]
-
-
-def scrape_etsy_two_stage(keyword, api_key, limit=20, provider="ScraperAPI", bd_google_id=None):
-    all_items = []
-
-    if provider == "ScraperAPI":
-        listing_urls = discover_etsy_urls_via_google(keyword, api_key, limit)
+        # Fallback to direct search if google discovery fails
         if not listing_urls:
-            listing_urls = discover_etsy_urls_direct(keyword, api_key, limit)
+            search_url = f'https://www.etsy.com/search?q={keyword.replace(" ", "+")}'
+            html = fetch_page_html(search_url, provider, api_key)
+            if html:
+                found = re.findall(r'https://www\.etsy\.com/listing/\d+(?:/[^"\'\s\\%]+)?', html)
+                seen = set()
+                for url in found:
+                    clean_url = url.split('?')[0]
+                    if clean_url not in seen:
+                        seen.add(clean_url)
+                        listing_urls.append(clean_url)
 
-        if not listing_urls:
-            st.sidebar.error("⚠️ Could not discover any Etsy listing URLs.")
-            return []
-
-        for rank, listing_url in enumerate(listing_urls, start=1):
+        all_items = []
+        for rank, listing_url in enumerate(listing_urls[:limit], start=1):
             detail_payload = {'api_key': api_key, 'url': listing_url, 'country_code': 'us', 'premium': 'true'}
             try:
                 resp = requests.get(SCRAPERAPI_ENDPOINT, params=detail_payload, timeout=70)
@@ -362,120 +419,44 @@ def scrape_etsy_two_stage(keyword, api_key, limit=20, provider="ScraperAPI", bd_
                     title = ld_data.get('name')
                 if not title:
                     og_title = soup.find('meta', property='og:title') or soup.find('meta', attrs={'name': 'twitter:title'})
-                    if og_title and og_title.get('content'):
-                        title = og_title.get('content')
-                    else:
-                        title_tag = soup.find('title')
-                        title = title_tag.string if title_tag else 'Unknown Item'
-
-                if isinstance(title, str):
-                    title = title.strip()
-                else:
-                    title = str(title)
+                    title = og_title.get('content') if og_title else 'Etsy Item'
 
                 price = "Check Site"
-                price_extracted = False
                 if ld_data:
                     offers = ld_data.get('offers', {})
                     if isinstance(offers, list):
                         offers = offers[0] if offers else {}
                     price_val = offers.get('price')
-                    price_currency = offers.get('priceCurrency', 'USD')
-                    curr_sym = "$" if price_currency == "USD" else price_currency
-                    try:
-                        if price_val:
-                            price = f"{curr_sym}{float(price_val):,.2f}"
-                            price_extracted = True
-                    except (TypeError, ValueError):
-                        pass
+                    curr = offers.get('priceCurrency', 'USD')
+                    curr_sym = "$" if curr == "USD" else curr
+                    price = f"{curr_sym}{float(price_val):,.2f}" if price_val else "Check Site"
 
-                if not price_extracted:
-                    meta_price = soup.find('meta', property='product:price:amount') or soup.find('meta', property='og:price:amount')
-                    meta_curr = soup.find('meta', property='product:price:currency') or soup.find('meta', property='og:price:currency')
-                    if meta_price and meta_price.get('content'):
-                        currency_val = meta_curr.get('content', 'USD') if meta_curr else 'USD'
-                        curr_sym = "$" if currency_val == "USD" else currency_val
-                        try:
-                            price = f"{curr_sym}{float(meta_price.get('content')):,.2f}"
-                            price_extracted = True
-                        except (TypeError, ValueError):
-                            pass
-
-                stock_status = "In Stock"
-                availability_raw = ""
-                if ld_data:
-                    offers = ld_data.get('offers', {})
-                    if isinstance(offers, list):
-                        offers = offers[0] if offers else {}
-                    availability_raw = offers.get('availability', '') or ''
-                
-                if availability_raw:
-                    stock_status = "Out of Stock" if 'OutOfStock' in availability_raw else "In Stock"
-                else:
-                    meta_avail = soup.find('meta', property='og:availability') or soup.find('meta', property='product:availability')
-                    if meta_avail and meta_avail.get('content'):
-                        avail_val = meta_avail.get('content').lower()
-                        if 'out' in avail_val or 'oos' in avail_val or 'instock' not in avail_val:
-                            stock_status = "Out of Stock"
-
-                img_url = None
-                if ld_data:
-                    img_url = extract_image_url(ld_data.get('image'))
+                img_url = extract_image_url(ld_data.get('image')) if ld_data else None
                 if not img_url:
-                    og_image = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
-                    if og_image and og_image.get('content'):
-                        img_url = og_image.get('content')
-
-                if img_url:
-                    if isinstance(img_url, str):
-                        if img_url.startswith('//'):
-                            img_url = f'https:{img_url}'
-                        img_url = img_url.replace(' ', '%20')
-                    else:
-                        img_url = None
-
-                if not img_url:
-                    img_url = "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
+                    og_image = soup.find('meta', property='og:image')
+                    img_url = og_image.get('content') if og_image else "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
 
                 all_items.append({
                     "Platform": "Etsy",
                     "Rank": rank,
                     "Preview": img_url,
-                    "Product Title": title,
+                    "Product Title": title.strip(),
                     "Price": price,
-                    "Stock Status": stock_status,
-                    "Link": (ld_data.get('url') if ld_data else None) or listing_url
+                    "Stock Status": "In Stock",
+                    "Link": listing_url
                 })
             except Exception as e:
-                print(f"Error fetching Etsy detail {listing_url}: {e}")
                 continue
+        return all_items
 
-    elif provider == "Bright Data (Web Scraper API)":
-        listing_urls = discover_etsy_urls_via_google_bd(keyword, api_key, bd_google_id, limit)
-        if not listing_urls:
-            st.sidebar.warning("ℹ️ Discovered 0 Etsy listings via Bright Data Google Scraper. Utilizing mock data fallback.")
-            return run_legacy_fallback(keyword, "Etsy", limit)
+    # If using Scrape.do or ScrapingBee, directly parse Etsy search HTML on the fly
+    else:
+        target_url = f"https://www.etsy.com/search?q={keyword.replace(' ', '+')}"
+        html = fetch_page_html(target_url, provider, api_key)
+        if html:
+            return parse_etsy_search_html(html, limit)
 
-        for rank, listing_url in enumerate(listing_urls, start=1):
-            sanitized_keyword = re.sub(r'[^a-zA-Z0-9]', '', keyword) or "product"
-            fallback_img = f"https://loremflickr.com/150/150/{sanitized_keyword}?lock={rank}"
-            all_items.append({
-                "Platform": "Etsy",
-                "Rank": rank,
-                "Preview": fallback_img,
-                "Product Title": f"Etsy {keyword.title()} - Handcrafted Custom Model {rank}",
-                "Price": f"${(rank * 18.50 + 12.00):,.2f}",
-                "Stock Status": "In Stock",
-                "Link": listing_url
-            })
-
-    return all_items
-
-
-def scrape_via_provider(keyword, platform, provider, api_key, limit=20, dataset_id=None):
-    if platform == "Etsy":
-        return scrape_etsy_two_stage(keyword, api_key, limit, provider, dataset_id)
-    return scrape_structured(keyword, platform, api_key, limit, provider, dataset_id)
+    return []
 
 
 # --- RENDER BACKUP SYSTEM VECTOR (MOCK DATA) ---
@@ -484,7 +465,7 @@ def run_legacy_fallback(search_keyword, platform, target_ceiling):
     sanitized_keyword = re.sub(r'[^a-zA-Z0-9]', '', search_keyword) or "product"
 
     for rank in range(1, target_ceiling + 1):
-        fallback_img = f"https://loremflickr.com/150/150/{sanitized_keyword}?lock={rank}"
+        fallback_img = f"https://cdn-icons-png.flaticon.com/512/3081/3081162.png"
         mock_price = f"${(rank * 12.49 + 9.99):,.2f}"
         mock_stock = "In Stock" if rank % 4 != 0 else "Low Stock"
 
@@ -506,7 +487,8 @@ st.set_page_config(page_title="Enterprise Market Scraper", page_icon="📈", lay
 st.sidebar.header("⚙️ System Configuration")
 st.sidebar.write("Configure your extraction credentials below.")
 
-api_provider = st.sidebar.selectbox("Active Proxy Provider:", ["ScraperAPI", "Bright Data (Web Scraper API)"])
+# Active general proxy provider selector
+api_provider = st.sidebar.selectbox("Active Proxy Provider:", ["ScraperAPI", "Scrape.do", "ScrapingBee"])
 
 client_proxy_key = st.sidebar.text_input(
     f"Paste {api_provider} API Key / Token:",
@@ -515,16 +497,8 @@ client_proxy_key = st.sidebar.text_input(
     key="proxy_api_key_input"
 )
 
-# Custom editable dataset inputs specifically for Bright Data Web Scraper API
-if api_provider == "Bright Data (Web Scraper API)":
-    st.sidebar.subheader("📋 Bright Data Dataset IDs")
-    bd_amazon_id = st.sidebar.text_input("Amazon Dataset ID:", value="gd_l7q7dkf244hwjntr0")
-    bd_ebay_id = st.sidebar.text_input("eBay Dataset ID:", value="gd_l1vikt72bvl7bjuj0")
-    bd_walmart_id = st.sidebar.text_input("Walmart Dataset ID:", value="gd_m7khey0wb7wviejgj")
-    bd_google_id = st.sidebar.text_input("Google SERP Dataset ID:", value="gd_mfz5x93lmsjjjylob")
-
 if client_proxy_key:
-    st.sidebar.success(f"✅ {api_provider} Direct Routing Active.")
+    st.sidebar.success(f"✅ {api_provider} Routing Active.")
 else:
     st.sidebar.warning("⚠️ Running via offline legacy mode (No Live Metrics).")
 
@@ -532,6 +506,7 @@ st.sidebar.write("---")
 
 st.sidebar.subheader("🛒 Store Selection")
 
+# Initialize and persist widget states safely using Streamlit's built-in key bindings
 platform_amazon = st.sidebar.checkbox("Amazon Marketplace", value=True, key="platform_amazon")
 platform_ebay = st.sidebar.checkbox("eBay Auctions", value=True, key="platform_ebay")
 platform_walmart = st.sidebar.checkbox("Walmart E-Commerce", value=True, key="platform_walmart")
@@ -575,32 +550,20 @@ if st.button("⚡ Execute Automated Mining Sequence"):
 
             for platform in target_platforms:
                 if client_proxy_key:
-                    if api_provider == "ScraperAPI":
-                        platform_data = scrape_via_provider(
+                    if platform == "Etsy":
+                        platform_data = scrape_etsy(
                             keyword=client_keyword,
-                            platform=platform,
-                            provider=api_provider,
-                            api_key=client_proxy_key,
-                            limit=results_per_platform
-                        )
-                    else:  # Bright Data (Web Scraper API)
-                        active_dataset_id = None
-                        if platform == "Amazon":
-                            active_dataset_id = bd_amazon_id
-                        elif platform == "eBay":
-                            active_dataset_id = bd_ebay_id
-                        elif platform == "Walmart":
-                            active_dataset_id = bd_walmart_id
-                        elif platform == "Etsy":
-                            active_dataset_id = bd_google_id
-
-                        platform_data = scrape_via_provider(
-                            keyword=client_keyword,
-                            platform=platform,
-                            provider=api_provider,
                             api_key=client_proxy_key,
                             limit=results_per_platform,
-                            dataset_id=active_dataset_id
+                            provider=api_provider
+                        )
+                    else:
+                        platform_data = scrape_structured(
+                            keyword=client_keyword,
+                            platform=platform,
+                            api_key=client_proxy_key,
+                            limit=results_per_platform,
+                            provider=api_provider
                         )
                     master_dataset.extend(platform_data)
                 else:
