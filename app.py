@@ -332,8 +332,6 @@ def scrape_structured(keyword, platform, api_key, limit=20, provider="ScraperAPI
                 continue
 
         # --- AUTO-FALLBACK TO DIRECT CRAWLING FOR SCRAPERAPI ---
-        # If your plan does not support structured searches, the app pulls the raw HTML 
-        # using generic proxy queries and extracts the lists locally.
         if platform == "Amazon":
             target_url = f"https://www.amazon.com/s?k={keyword.replace(' ', '+')}"
             html = fetch_page_html(target_url, "ScraperAPI", api_key)
@@ -460,7 +458,7 @@ def scrape_etsy(keyword, api_key, limit=20, provider="ScraperAPI"):
             except Exception as e:
                 continue
 
-        # If ScraperAPI premium detail crawl/Google search failed to return items,
+        # If ScraperAPI detail crawl/Google search failed to return items,
         # fallback to directly scraping the Etsy search page and parsing it locally.
         if not all_items:
             target_url = f"https://www.etsy.com/search?q={keyword.replace(' ', '+')}"
@@ -526,15 +524,48 @@ st.sidebar.write("---")
 
 st.sidebar.subheader("🛒 Store Selection")
 
-# Render checkboxes with simple default values.
-# Removing 'key' parameters here stops Streamlit from force-locking checked states on.
-platform_amazon = st.sidebar.checkbox("Amazon Marketplace", value=True)
-platform_ebay = st.sidebar.checkbox("eBay Auctions", value=True)
-platform_walmart = st.sidebar.checkbox("Walmart E-Commerce", value=True)
-platform_etsy = st.sidebar.checkbox("Etsy Handmade & Vintage", value=True)
+# Step 1: Initialize states in st.session_state on the very first run to manage values reliably
+if "platform_amazon" not in st.session_state:
+    st.session_state.platform_amazon = True
+if "platform_ebay" not in st.session_state:
+    st.session_state.platform_ebay = True
+if "platform_walmart" not in st.session_state:
+    st.session_state.platform_walmart = True
+if "platform_etsy" not in st.session_state:
+    st.session_state.platform_etsy = True
 
-# Build targets dynamically based on widget return variables
+# Step 2: Render checkboxes using ONLY the key attribute.
+# Crucially, omitting 'value=True' here prevents Streamlit from resetting the state back to True on reruns.
+st.sidebar.checkbox("Amazon Marketplace", key="platform_amazon")
+st.sidebar.checkbox("eBay Auctions", key="platform_ebay")
+st.sidebar.checkbox("Walmart E-Commerce", key="platform_walmart")
+st.sidebar.checkbox("Etsy Handmade & Vintage", key="platform_etsy")
+
+# Step 3: Access states directly from session_state keys
 target_platforms = []
-if platform_amazon:
+if st.session_state.platform_amazon:
     target_platforms.append("Amazon")
-if platform
+if st.session_state.platform_ebay:
+    target_platforms.append("eBay")
+if st.session_state.platform_walmart:
+    target_platforms.append("Walmart")
+if st.session_state.platform_etsy:
+    target_platforms.append("Etsy")
+
+results_per_platform = st.sidebar.slider("Target Results Per Platform:", min_value=5, max_value=50, value=15, step=5)
+
+image_size = st.sidebar.slider(
+    "Row / Image Preview Size (px):",
+    min_value=35,
+    max_value=150,
+    value=80,
+    step=5,
+    help="Increase to make product preview images larger in the table below."
+)
+
+st.sidebar.write("---")
+
+st.title("📈 Enterprise E-Commerce Data Workspace")
+st.write("On-demand marketplace extraction engine for competitive intelligence and retail data sheets.")
+
+client_keyword = st.text_input("Enter Focus Product Keyword:", pla
