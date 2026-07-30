@@ -21,7 +21,7 @@ def extract_image_url(image_field):
         image_field = image_field[0] if image_field else None
 
     if isinstance(image_field, dict):
-        image_field = image_field.get('url') or image_field.get('contentUrl')
+        image_field = image_field.get('url') or image_field.get('contentUrl') or image_field.get('value')
 
     if isinstance(image_field, str) and image_field:
         if image_field.startswith('//'):
@@ -29,6 +29,27 @@ def extract_image_url(image_field):
         return image_field
 
     return None
+
+
+def find_product_node(data):
+    """
+    Recursively search for any dictionary inside lists or dicts that
+    contains '@type': 'Product' to support complex JSON-LD structures.
+    """
+    if isinstance(data, dict):
+        if data.get('@type') == 'Product':
+            return data
+        for val in data.values():
+            result = find_product_node(val)
+            if result:
+                return result
+    elif isinstance(data, list):
+        for item in data:
+            result = find_product_node(item)
+            if result:
+                return result
+    return None
+
 
 # --- SCRAPERAPI ADAPTIVE ENGINE (Amazon / eBay / Walmart -> structured JSON) ---
 def scrape_structured(keyword, platform, api_key, limit=20):
@@ -58,7 +79,6 @@ def scrape_structured(keyword, platform, api_key, limit=20):
                 data = response.json()
 
                 # Different platforms nest results under different top-level keys:
-                # Walmart -> "items", Amazon/eBay -> "results" / "item_results".
                 if isinstance(data, list):
                     results = data
                 else:
@@ -133,18 +153,6 @@ def scrape_structured(keyword, platform, api_key, limit=20):
 
 
 # --- ETSY: TWO-STAGE SCRAPE ---
-# Etsy has no ScraperAPI structured endpoint, and its search/results grid is
-# one of the hardest pages on the site to render + get past anti-bot checks
-# (real 500s from ScraperAPI mean it genuinely lost that fight). Rather than
-# hammering Etsy's own search page directly, we discover listing URLs via a
-# much friendlier target -- Google's structured Search endpoint -- and only
-# fall back to Etsy's search page directly as a last resort.
-#   Stage 1a: query Google (site:etsy.com/listing KEYWORD) via ScraperAPI's
-#             structured Google Search endpoint for listing URLs.
-#   Stage 1b (fallback): render Etsy's own search page with premium=true.
-#   Stage 2: fetch each individual listing page (lighter target, no render
-#            needed) and pull the clean structured data Etsy embeds as
-#            schema.org JSON-LD in the page source.
 def discover_etsy_urls_via_google(keyword, api_key, limit):
     payload = {
         'api_key': api_key,
@@ -178,7 +186,12 @@ def discover_etsy_urls_direct(keyword, api_key, limit):
     try:
         resp = requests.get(SCRAPERAPI_ENDPOINT, params=payload, timeout=70)
         if resp.status_code == 200:
-            found = re.findall(r'https://www\.etsy\.com/listing/\d+/[^"\'\s]+', resp.text)
+            # Match both unescaped and escaped Etsy listing URLs
+            found = re.findall(r'https://www\.etsy\.com/listing/\d+(?:/[^"\'\s\\%]+)?', resp.text)
+            found_escaped = re.findall(r'https:\\/\\/www\.etsy\.com\\/listing\\/\d+(?:\\/[^"\'\s\\+d]+)?', resp.text)
+            for url in found_escaped:
+                found.append(url.replace('\\/', '/'))
+
             seen = set()
             for url in found:
                 clean_url = url.split('?')[0]
@@ -216,6 +229,8 @@ def scrape_etsy_two_stage(keyword, api_key, limit=20):
                 continue
 
             soup = BeautifulSoup(resp.text, 'html.parser')
+            
+            # Extract JSON-LD
             ld_data = None
             for script in soup.find_all('script', attrs={'type': 'application/ld+json'}):
                 if not script.string:
@@ -225,43 +240,108 @@ def scrape_etsy_two_stage(keyword, api_key, limit=20):
                 except (json.JSONDecodeError, TypeError):
                     continue
 
-                candidates = parsed if isinstance(parsed, list) else [parsed]
-                for candidate in candidates:
-                    if isinstance(candidate, dict) and candidate.get('@type') == 'Product':
-                        ld_data = candidate
-                        break
+                ld_data = find_product_node(parsed)
                 if ld_data:
                     break
 
-            if not ld_data:
-                continue
+            # --- EXTRACT TITLE ---
+            title = None
+            if ld_data:
+                title = ld_data.get('name')
+            if not title:
+                og_title = soup.find('meta', property='og:title') or soup.find('meta', attrs={'name': 'twitter:title'})
+                if og_title and og_title.get('content'):
+                    title = og_title.get('content')
+                else:
+                    title_tag = soup.find('title')
+                    title = title_tag.string if title_tag else 'Unknown Item'
 
-            title = ld_data.get('name', 'Unknown Item')
+            if isinstance(title, str):
+                title = title.strip()
+            else:
+                title = str(title)
 
-            offers = ld_data.get('offers', {})
-            if isinstance(offers, list):
-                offers = offers[0] if offers else {}
-            price_val = offers.get('price')
-            price_currency = offers.get('priceCurrency', 'USD')
-            curr_sym = "$" if price_currency == "USD" else price_currency
-            try:
-                price = f"{curr_sym}{float(price_val):,.2f}" if price_val else "Check Site"
-            except (TypeError, ValueError):
-                price = "Check Site"
+            # --- EXTRACT PRICE ---
+            price = "Check Site"
+            price_extracted = False
+            if ld_data:
+                offers = ld_data.get('offers', {})
+                if isinstance(offers, list):
+                    offers = offers[0] if offers else {}
+                price_val = offers.get('price')
+                price_currency = offers.get('priceCurrency', 'USD')
+                curr_sym = "$" if price_currency == "USD" else price_currency
+                try:
+                    if price_val:
+                        price = f"{curr_sym}{float(price_val):,.2f}"
+                        price_extracted = True
+                except (TypeError, ValueError):
+                    pass
 
-            availability_raw = offers.get('availability', '') or ''
-            stock_status = "Out of Stock" if 'OutOfStock' in availability_raw else "In Stock"
+            if not price_extracted:
+                meta_price = soup.find('meta', property='product:price:amount') or soup.find('meta', property='og:price:amount')
+                meta_curr = soup.find('meta', property='product:price:currency') or soup.find('meta', property='og:price:currency')
+                if meta_price and meta_price.get('content'):
+                    currency_val = meta_curr.get('content', 'USD') if meta_curr else 'USD'
+                    curr_sym = "$" if currency_val == "USD" else currency_val
+                    try:
+                        price = f"{curr_sym}{float(meta_price.get('content')):,.2f}"
+                        price_extracted = True
+                    except (TypeError, ValueError):
+                        pass
 
-            img_url = extract_image_url(ld_data.get('image')) or "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
+            # --- EXTRACT STOCK STATUS ---
+            stock_status = "In Stock"
+            availability_raw = ""
+            if ld_data:
+                offers = ld_data.get('offers', {})
+                if isinstance(offers, list):
+                    offers = offers[0] if offers else {}
+                availability_raw = offers.get('availability', '') or ''
+            
+            if availability_raw:
+                stock_status = "Out of Stock" if 'OutOfStock' in availability_raw else "In Stock"
+            else:
+                meta_avail = soup.find('meta', property='og:availability') or soup.find('meta', property='product:availability')
+                if meta_avail and meta_avail.get('content'):
+                    avail_val = meta_avail.get('content').lower()
+                    if 'out' in avail_val or 'oos' in avail_val or 'instock' not in avail_val:
+                        stock_status = "Out of Stock"
+
+            # --- EXTRACT IMAGE URL ---
+            img_url = None
+            if ld_data:
+                img_url = extract_image_url(ld_data.get('image'))
+            
+            if not img_url:
+                og_image = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
+                if og_image and og_image.get('content'):
+                    img_url = og_image.get('content')
+            
+            if not img_url:
+                carousel_img = soup.find('img', class_=re.compile(r'carousel|listing|product', re.I))
+                if carousel_img:
+                    img_url = carousel_img.get('src') or carousel_img.get('data-src') or carousel_img.get('data-src-zoom-image')
+
+            if img_url:
+                if isinstance(img_url, str):
+                    if img_url.startswith('//'):
+                        img_url = f'https:{img_url}'
+                    img_url = img_url.replace(' ', '%20')
+                else:
+                    img_url = None
+
+            if not img_url:
+                img_url = "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
 
             all_items.append({
                 "Platform": "Etsy",
                 "Rank": rank,
                 "Preview": img_url,
-                "Product Title": title.strip() if isinstance(title, str) else str(title),
+                "Product Title": title,
                 "Price": price,
                 "Stock Status": stock_status,
-                "Link": ld_data.get('url') or listing_url
+                "Link": (ld_data.get('url') if ld_data else None) or listing_url
             })
 
         except Exception as e:
@@ -318,37 +398,22 @@ else:
 
 st.sidebar.write("---")
 
-# Platform toggle checkboxes.
-# FIX: each checkbox now has an explicit, unique `key=`. Without an explicit
-# key, Streamlit auto-generates one from the label + position in the script;
-# if that identity gets confused across reruns (e.g. after the "Execute"
-# button triggers a rerun), the widget can silently reset to its `value=`
-# default instead of keeping what you clicked. Explicit keys backed by
-# session_state make each checkbox's state deterministic.
 st.sidebar.subheader("🛒 Store Selection")
 
-if "platform_amazon" not in st.session_state:
-    st.session_state.platform_amazon = True
-if "platform_ebay" not in st.session_state:
-    st.session_state.platform_ebay = True
-if "platform_walmart" not in st.session_state:
-    st.session_state.platform_walmart = True
-if "platform_etsy" not in st.session_state:
-    st.session_state.platform_etsy = True
-
-st.sidebar.checkbox("Amazon Marketplace", key="platform_amazon")
-st.sidebar.checkbox("eBay Auctions", key="platform_ebay")
-st.sidebar.checkbox("Walmart E-Commerce", key="platform_walmart")
-st.sidebar.checkbox("Etsy Handmade & Vintage", key="platform_etsy")
+# Initialize and persist widget states safely using Streamlit's built-in key bindings
+platform_amazon = st.sidebar.checkbox("Amazon Marketplace", value=True, key="platform_amazon")
+platform_ebay = st.sidebar.checkbox("eBay Auctions", value=True, key="platform_ebay")
+platform_walmart = st.sidebar.checkbox("Walmart E-Commerce", value=True, key="platform_walmart")
+platform_etsy = st.sidebar.checkbox("Etsy Handmade & Vintage", value=True, key="platform_etsy")
 
 target_platforms = []
-if st.session_state.platform_amazon:
+if platform_amazon:
     target_platforms.append("Amazon")
-if st.session_state.platform_ebay:
+if platform_ebay:
     target_platforms.append("eBay")
-if st.session_state.platform_walmart:
+if platform_walmart:
     target_platforms.append("Walmart")
-if st.session_state.platform_etsy:
+if platform_etsy:
     target_platforms.append("Etsy")
 
 results_per_platform = st.sidebar.slider("Target Results Per Platform:", min_value=5, max_value=50, value=15, step=5)
@@ -425,4 +490,3 @@ if st.button("⚡ Execute Automated Mining Sequence"):
                 st.error("The API request returned no records from the active providers. Verify remaining credit balances.")
     else:
         st.error("Please enter a focus product keyword target to begin.")
-
