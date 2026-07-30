@@ -8,6 +8,28 @@ from bs4 import BeautifulSoup
 
 SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com/"
 
+
+def extract_image_url(image_field):
+    """
+    Normalize a schema.org `image` value into a plain URL string.
+    Per spec, `image` can be a URL string, a fully described ImageObject
+    dict ({"@type": "ImageObject", "url": "..."}), or a list of either.
+    Also fixes protocol-relative URLs (e.g. "//i.etsystatic.com/...")
+    which need a scheme prefixed before they'll load in a browser table.
+    """
+    if isinstance(image_field, list):
+        image_field = image_field[0] if image_field else None
+
+    if isinstance(image_field, dict):
+        image_field = image_field.get('url') or image_field.get('contentUrl')
+
+    if isinstance(image_field, str) and image_field:
+        if image_field.startswith('//'):
+            return f'https:{image_field}'
+        return image_field
+
+    return None
+
 # --- SCRAPERAPI ADAPTIVE ENGINE (Amazon / eBay / Walmart -> structured JSON) ---
 def scrape_structured(keyword, platform, api_key, limit=20):
     all_items = []
@@ -230,10 +252,7 @@ def scrape_etsy_two_stage(keyword, api_key, limit=20):
             availability_raw = offers.get('availability', '') or ''
             stock_status = "Out of Stock" if 'OutOfStock' in availability_raw else "In Stock"
 
-            image = ld_data.get('image')
-            if isinstance(image, list):
-                image = image[0] if image else None
-            img_url = image or "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
+            img_url = extract_image_url(ld_data.get('image')) or "https://cdn-icons-png.flaticon.com/512/1170/1170576.png"
 
             all_items.append({
                 "Platform": "Etsy",
